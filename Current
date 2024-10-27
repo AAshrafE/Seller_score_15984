@@ -1,0 +1,977 @@
+CREATE PROCEDURE [etl].[P_SELLER_SCORE]  (@SK_AUD bigint = -1, @RELOAD_DATE date = null)
+AS
+BEGIN
+
+	DECLARE @SK_DATE_SNAPSHOT int = FORMAT(GETDATE(),'yyyyMMdd')
+	DECLARE @SK_NEXT_SNAPSHOT int = FORMAT(DATEADD(DAY,1,GETDATE()),'yyyyMMdd')
+	DECLARE @country_code NVARCHAR(2) = DBO.F_GET_COUNTRY_CODE();
+        -- parameters
+        --DECLARE @keep_snapshots_back INT;	--determines how many days back will the full history be kept 
+        DECLARE @running_day INT;
+        DECLARE @kpi_week_day VARCHAR(20);
+        DECLARE @back_forward_calculation VARCHAR(20);	
+
+        SELECT @kpi_week_day = CAST(SELLERCOACH_VENDOR_KPIS_DAY AS VARCHAR(20)),
+               @running_day = CAST(SELLERCOACH_MONTH_RUNING_DAY AS INT),
+               --@keep_snapshots_back = CAST(SELLERCOACH_SNAPSHOTS_TO_KEEP AS INT),
+               @back_forward_calculation = CAST(SELLERCOACH_BACK_FORWARD_CALCULATION AS VARCHAR(20))
+        FROM
+        (
+            SELECT *
+            FROM
+            (
+                SELECT P.PARAM_VALUE,
+                       P.PARAM_KEY,
+                       ROW_NUMBER() OVER(PARTITION BY P.PARAM_KEY
+                       ORDER BY P.COUNTRY_CODE DESC) AS _RN
+                FROM [$(JUMIA_BI_CONFIG)].DBO.CFG_PARAMETERS AS P
+                WHERE P.PARAM_KEY IN('SELLERCOACH_VENDOR_KPIS_DAY', 'SELLERCOACH_MONTH_RUNING_DAY', 'SELLERCOACH_SNAPSHOTS_TO_KEEP', 'SELLERCOACH_BACK_FORWARD_CALCULATION')
+                AND (P.COUNTRY_CODE = @country_code
+                     OR P.COUNTRY_CODE = 'ALL')
+            ) AS P
+            WHERE P._RN = 1
+        ) AS P PIVOT(MAX(PARAM_VALUE) FOR PARAM_KEY IN(SELLERCOACH_VENDOR_KPIS_DAY,
+                                                       SELLERCOACH_MONTH_RUNING_DAY,
+                                                       SELLERCOACH_SNAPSHOTS_TO_KEEP,
+                                                       SELLERCOACH_BACK_FORWARD_CALCULATION)) AS PVT;
+
+
+        --if this will change please change P_FCT_SUPPLIER_RATINGS 
+        DROP TABLE IF EXISTS #RUNNING_DAYS;
+        SELECT DD.DATE, ROW_NUMBER() OVER(PARTITION BY DD.COD_MONTH ORDER BY DD.SK_DATE) AS RN INTO #RUNNING_DAYS
+        FROM DIM_DATE AS DD
+        WHERE DD.DSC_DAY_WEEK_LONG = @kpi_week_day AND DD.COD_YEAR >= DATEPART(YEAR, DATEADD(year, -1, GETDATE()))
+        ORDER BY 1;
+
+		
+
+		-- JUST RUN IN THIS SITUATION
+        IF  CAST(DATEADD(DAY, -1, GETDATE()) AS DATE) NOT IN (SELECT ST.DATE FROM #RUNNING_DAYS AS ST)
+			RETURN
+			
+			DECLARE @sk_date_7d INT;
+			DECLARE @sk_date_13d INT;
+			DECLARE @sk_date_34d INT;
+
+			SELECT @sk_date_7d = DD2.SK_DATE,
+				   @sk_date_13d = FORMAT(DATEADD(DAY, -6, DD2.DATE), 'yyyyMMdd'),
+				   @sk_date_34d = FORMAT(DATEADD(DAY, -27, DD2.DATE), 'yyyyMMdd')
+			FROM DBO.DIM_DATE AS DD
+				 JOIN DBO.DIM_DATE AS DD2 ON DD.COD_WEEK = DD2.COD_WEEK
+			WHERE DD.[DATE] = CAST(DATEADD(WEEK,
+										   CASE
+											   WHEN @back_forward_calculation = 'FORWARD'
+											   THEN -1
+											   WHEN @back_forward_calculation = 'BACKWARD'
+											   THEN -2
+										   END, GETDATE()) AS DATE)
+				  AND DD2.DSC_DAY_WEEK_LONG = 'SUNDAY';
+
+
+
+        DECLARE @l7d_cr FLOAT;
+        DECLARE @l28d_cr FLOAT;
+        DECLARE @l7d_dos FLOAT;
+        DECLARE @l28d_dos FLOAT;
+        DECLARE @sellerscore_cr FLOAT;
+        DECLARE @l7d_qrr FLOAT;
+        DECLARE @l28d_qrr FLOAT;
+        DECLARE @sellerscore_qrr FLOAT;
+        DECLARE @s3_age FLOAT;
+        DECLARE @s3_sov FLOAT;
+        DECLARE @s5_age FLOAT;
+        DECLARE @s5_sov FLOAT;
+        DECLARE @l7d_acr FLOAT;
+        DECLARE @l28d_acr FLOAT;
+        DECLARE @sellerscore_acr FLOAT;
+        DECLARE @DOS_0D FLOAT;
+		DECLARE @DOS_1D FLOAT;
+		DECLARE @DOS_2D FLOAT;
+		DECLARE @DOS_3D FLOAT;
+		DECLARE @DOS_4D FLOAT;
+		DECLARE @DOS_5D FLOAT;
+		DECLARE @DOS_6D FLOAT;
+		DECLARE @DOS_Saturdays FLOAT;
+		DECLARE @JG_DOS_0D FLOAT;
+		DECLARE @JG_DOS_1D FLOAT;
+		DECLARE @JG_DOS_2D FLOAT;
+		DECLARE @JG_DOS_3D FLOAT;
+		DECLARE @JG_DOS_4D FLOAT;
+		DECLARE @JG_DOS_5D FLOAT;
+		DECLARE @JG_DOS_6D FLOAT;
+		DECLARE @JG_DOS_Saturdays FLOAT;
+
+        DROP TABLE IF EXISTS #TOOLS_KPI;
+        WITH TOOLS_PARAMETERS
+             AS (SELECT PKPI.COD_CODE AS P_COD_CODE,
+                        CKPI.COD_CODE AS C_COD_CODE,
+                        CASE
+                            WHEN CKPI.COD_CODE IS NOT NULL
+                            THEN SKPI.MTR_THRESHOLD / 100.0
+                            ELSE SKPI.MTR_THRESHOLD
+                        END AS MTR_THRESHOLD,
+                        SKPI.DAT_START_DATE,
+                        LEAD(DATEADD(DAY, -1, SKPI.DAT_START_DATE), 1, '99991231') OVER(PARTITION BY PKPI.COD_CODE,
+                                                                                                     CKPI.COD_CODE
+                        ORDER BY SKPI.DAT_START_DATE) DAT_END_DATE
+                 FROM [$(JUMIA_BI_STG)].DBO.PRE_TOOLS_SINGLE_KPI AS SKPI
+                      JOIN [$(JUMIA_BI_STG)].DBO.PRE_TOOLS_KPI AS PKPI ON PKPI.ID = SKPI.COD_KPI_PARENT
+                                                                         AND PKPI.FLG_IS_DELETED = 0
+                      LEFT JOIN [$(JUMIA_BI_STG)].DBO.PRE_TOOLS_KPI AS CKPI ON CKPI.ID = SKPI.COD_KPI_CHILD
+                                                                              AND CKPI.FLG_IS_DELETED = 0
+                 WHERE PKPI.COD_TYPE = 'SINGLE'
+                       -- NOT DELETED
+                       AND SKPI.FLG_IS_DELETED = 0
+                       -- GROUP
+                       AND PKPI.COD_GROUP = 'SELLER_SCORE'),
+             TP
+             AS (SELECT *
+                 FROM TOOLS_PARAMETERS AS TP
+                 WHERE DATEADD(DAY, -1, GETDATE()) BETWEEN TP.DAT_START_DATE AND TP.DAT_END_DATE)
+             SELECT @l7d_cr =
+             (
+                 SELECT TP.MTR_THRESHOLD
+                 FROM TP
+                 WHERE TP.C_COD_CODE = 'L7D'
+                       AND TP.P_COD_CODE = 'CR'
+             ),
+                    @l7d_qrr =
+             (
+                 SELECT TP.MTR_THRESHOLD
+                 FROM TP
+                 WHERE TP.C_COD_CODE = 'L7D'
+                       AND TP.P_COD_CODE = 'QRR'
+             ),
+                    @l28d_cr =
+             (
+                 SELECT TP.MTR_THRESHOLD
+                 FROM TP
+                 WHERE TP.C_COD_CODE = 'L28D'
+                       AND TP.P_COD_CODE = 'CR'
+             ),
+                    @l28d_qrr =
+             (
+                 SELECT TP.MTR_THRESHOLD
+                 FROM TP
+                 WHERE TP.C_COD_CODE = 'L28D'
+                       AND TP.P_COD_CODE = 'QRR'
+             ),
+                    @l7d_acr =
+             (
+                 SELECT TP.MTR_THRESHOLD
+                 FROM TP
+                 WHERE TP.C_COD_CODE = 'L7D'
+                       AND TP.P_COD_CODE = 'ACR'
+             ),
+                    @l28d_acr =
+             (
+                 SELECT TP.MTR_THRESHOLD
+                 FROM TP
+                 WHERE TP.C_COD_CODE = 'L28D'
+                       AND TP.P_COD_CODE = 'ACR'
+             ),
+                    @sellerscore_cr =
+             (
+                 SELECT TP.MTR_THRESHOLD
+                 FROM TP
+                 WHERE TP.C_COD_CODE = 'CR'
+                       AND TP.P_COD_CODE = 'SELLERSCORE'
+             ),
+                    @sellerscore_qrr =
+             (
+                 SELECT TP.MTR_THRESHOLD
+                 FROM TP
+                 WHERE TP.C_COD_CODE = 'QRR'
+                       AND TP.P_COD_CODE = 'SELLERSCORE'
+             ),
+                    @sellerscore_acr =
+             (
+                 SELECT TP.MTR_THRESHOLD
+                 FROM TP
+                 WHERE TP.C_COD_CODE = 'ACR'
+                       AND TP.P_COD_CODE = 'SELLERSCORE'
+             ),
+                    @s3_age =
+             (
+                 SELECT TP.MTR_THRESHOLD
+                 FROM TP
+                 WHERE TP.P_COD_CODE = 'S3_AGE'
+             ),
+                    @s3_sov =
+             (
+                 SELECT TP.MTR_THRESHOLD
+                 FROM TP
+                 WHERE TP.P_COD_CODE = 'S3_SOV'
+             ),
+                    @s5_age =
+             (
+                 SELECT TP.MTR_THRESHOLD
+                 FROM TP
+                 WHERE TP.P_COD_CODE = 'S5_AGE'
+             ),
+                    @s5_sov =
+             (
+                 SELECT TP.MTR_THRESHOLD
+                 FROM TP
+                 WHERE TP.P_COD_CODE = 'S5_SOV'
+             ),
+                    @l7d_dos =
+             (
+                 SELECT TP.MTR_THRESHOLD
+                 FROM TP
+                 WHERE TP.C_COD_CODE = 'L7D'
+                   AND TP.P_COD_CODE = 'DOS'
+             ),
+                    @l28d_dos =
+             (
+                 SELECT TP.MTR_THRESHOLD
+                 FROM TP
+                 WHERE TP.C_COD_CODE = 'L28D'
+                   AND TP.P_COD_CODE = 'DOS'
+             ),
+                    @DOS_0D =
+             (
+                 SELECT TP.MTR_THRESHOLD
+                 FROM TP
+                 WHERE TP.P_COD_CODE = 'DOS_0D'
+             ),
+                    @DOS_1D =
+             (
+                 SELECT TP.MTR_THRESHOLD
+                 FROM TP
+                 WHERE TP.P_COD_CODE = 'DOS_1D'
+             ),
+                    @DOS_2D =
+             (
+                 SELECT TP.MTR_THRESHOLD
+                 FROM TP
+                 WHERE TP.P_COD_CODE = 'DOS_2D'
+             ),
+                    @DOS_3D =
+             (
+                 SELECT TP.MTR_THRESHOLD
+                 FROM TP
+                 WHERE TP.P_COD_CODE = 'DOS_3D'
+             ),
+                    @DOS_4D =
+             (
+                 SELECT TP.MTR_THRESHOLD
+                 FROM TP
+                 WHERE TP.P_COD_CODE = 'DOS_4D'
+             ),
+                    @DOS_5D =
+             (
+                 SELECT TP.MTR_THRESHOLD
+                 FROM TP
+                 WHERE TP.P_COD_CODE = 'DOS_5D'
+             ),
+                    @DOS_6D =
+             (
+                 SELECT TP.MTR_THRESHOLD
+                 FROM TP
+                 WHERE TP.P_COD_CODE = 'DOS_6D+'
+             ),
+                    @DOS_Saturdays =
+             (
+                 SELECT TP.MTR_THRESHOLD
+                 FROM TP
+                 WHERE TP.P_COD_CODE = 'DOS_Saturdays'
+             ),
+                    @JG_DOS_0D =
+             (
+                 SELECT TP.MTR_THRESHOLD
+                 FROM TP
+                 WHERE TP.P_COD_CODE = 'JG_DOS_0D'
+             ),
+                    @JG_DOS_1D =
+             (
+                 SELECT TP.MTR_THRESHOLD
+                 FROM TP
+                 WHERE TP.P_COD_CODE = 'JG_DOS_1D'
+             ),
+                    @JG_DOS_2D =
+             (
+                 SELECT TP.MTR_THRESHOLD
+                 FROM TP
+                 WHERE TP.P_COD_CODE = 'JG_DOS_2D'
+             ),
+                    @JG_DOS_3D =
+             (
+                 SELECT TP.MTR_THRESHOLD
+                 FROM TP
+                 WHERE TP.P_COD_CODE = 'JG_DOS_3D'
+             ),
+                    @JG_DOS_4D =
+             (
+                 SELECT TP.MTR_THRESHOLD
+                 FROM TP
+                 WHERE TP.P_COD_CODE = 'JG_DOS_4D'
+             ),
+                    @JG_DOS_5D =
+             (
+                 SELECT TP.MTR_THRESHOLD
+                 FROM TP
+                 WHERE TP.P_COD_CODE = 'JG_DOS_5D'
+             ),
+                    @JG_DOS_6D =
+             (
+                 SELECT TP.MTR_THRESHOLD
+                 FROM TP
+                 WHERE TP.P_COD_CODE = 'JG_DOS_6D+'
+             ),
+                    @JG_DOS_Saturdays =
+             (
+                 SELECT TP.MTR_THRESHOLD
+                 FROM TP
+                 WHERE TP.P_COD_CODE = 'JG_DOS_Saturdays'
+             )
+			 ;
+
+
+        DROP TABLE IF EXISTS #TOOLS_RANGE_KPI;
+        SELECT *
+        INTO #TOOLS_RANGE_KPI
+        FROM
+        (
+            SELECT PKPI.COD_CODE AS P_COD_CODE,
+                   CKPI.COD_CODE AS C_COD_CODE,
+                   -- TO FORCE TO 100.01 TO CAPTURE THE 100, OTHEWISE 100 WILL BE EXCLUDED (ONLY FOR VERY BAD)
+                   IIF(RKPI.MTR_MAX = 100
+                       AND RKPI.MTR_SCORE = 0, 100.01, IIF(RKPI.MTR_MAX = 5
+                                                           AND RKPI.MTR_SCORE = 5, 5.01, RKPI.MTR_MAX)) AS MTR_MAX,
+                   RKPI.MTR_MIN,
+                   RKPI.MTR_SCORE,
+                   RC.DSC_DESCRIPTION AS DSC_RATING_CLASS,
+                   RKPI.DAT_START_DATE,
+                   LEAD(DATEADD(DAY, -1, RKPI.DAT_START_DATE), 1, '99991231') OVER(PARTITION BY PKPI.COD_CODE,
+                                                                                                CKPI.COD_CODE,
+                                                                                                RKPI.MTR_SCORE
+                   ORDER BY RKPI.DAT_START_DATE) DAT_END_DATE
+            FROM [$(JUMIA_BI_STG)].DBO.PRE_TOOLS_RANGE_KPI AS RKPI
+                 JOIN [$(JUMIA_BI_STG)].DBO.PRE_TOOLS_RATING_CLASS AS RC ON RC.ID = RKPI.COD_RATING_CLASS
+                                                                           AND RC.FLG_IS_DELETED = 0
+                 JOIN [$(JUMIA_BI_STG)].DBO.PRE_TOOLS_KPI AS PKPI ON PKPI.ID = RKPI.COD_KPI_PARENT
+                                                                    AND PKPI.FLG_IS_DELETED = 0
+                 LEFT JOIN [$(JUMIA_BI_STG)].DBO.PRE_TOOLS_KPI AS CKPI ON CKPI.ID = RKPI.COD_KPI_CHILD
+                                                                         AND CKPI.FLG_IS_DELETED = 0
+            WHERE PKPI.COD_TYPE = 'RANGE'
+                  -- NOT DELETED
+                  AND RKPI.FLG_IS_DELETED = 0
+                  -- GROUP 
+                  AND PKPI.COD_GROUP = 'SELLER_SCORE'
+        ) AS RKPI
+        WHERE GETDATE() BETWEEN RKPI.DAT_START_DATE AND RKPI.DAT_END_DATE;
+
+
+
+
+-- FALTA FAZER O IF AKI
+
+                DROP TABLE IF EXISTS #TEMP_QC;
+                SELECT X.*
+                INTO #TEMP_QC
+                FROM
+                (
+                    SELECT RQC.SK_SALES_ORDER_ITEM,
+                           RQC.SK_QC_REASON,
+                           ROW_NUMBER() OVER(PARTITION BY RQC.SK_SALES_ORDER_ITEM
+                           ORDER BY RQC.SK_DATE ASC,
+                                    RQC.SK_TIME ASC) AS RN -- ordering in ascending to capture only the CR aftersale QC
+                    --into #temp_qc
+                    FROM DBO.V_M01_F33_FCT_REVERSE_QC_RESULT AS RQC
+                         INNER JOIN DBO.FCT_RMA_RETURN_ORDER_ITEM AS RROI ON RROI.SK_SALES_ORDER_ITEM = RQC.SK_SALES_ORDER_ITEM
+                         JOIN DBO.DIM_SYSTEM AS SY ON SY.SK_SYSTEM = RQC.SK_SYSTEM
+                    WHERE SY.COD_SYSTEM = 'wmt'
+                          -- PTBI-7992
+                          AND RQC.DSC_RESPONSIBLE = 'Vendor'
+                ) AS X
+                WHERE X.RN = 1;
+
+              -- ACR TABLE
+           DROP TABLE IF EXISTS #ACR_TABLE;
+           SELECT CRR.SK_SUPPLIER,
+                  AVG(CASE
+                          WHEN CRR.SK_DATE BETWEEN @sk_date_13d AND @sk_date_7d
+                          THEN CAST(MTR_RATING AS FLOAT)
+                          ELSE NULL
+                      END) AS ACR_7D,
+		COUNT(CASE 
+			WHEN CRR.SK_DATE BETWEEN @sk_date_13d AND @sk_date_7d 
+			THEN 1 
+			ELSE NULL
+			END
+		) AS NR_CR_7D,
+                  AVG(CASE
+                          WHEN CRR.SK_DATE BETWEEN @sk_date_34d AND @sk_date_7d
+                          THEN CAST(MTR_RATING AS FLOAT)
+                          ELSE NULL
+                      END) AS ACR_28D,
+		COUNT(CASE 
+			WHEN CRR.SK_DATE BETWEEN @sk_date_34d AND @sk_date_7d 
+			THEN 1 
+			ELSE NULL
+			END
+		) AS NR_CR_28D
+           INTO #ACR_TABLE
+           FROM CUBE.V_FCT_CUSTOMER_RATING_REVIEW AS CRR
+           WHERE CRR.SK_DATE >= @sk_date_34d
+             GROUP BY CRR.SK_SUPPLIER;
+
+				DROP TABLE IF EXISTS #OVERRIDE_SELLER_SCORE
+				SELECT SKPI.MTR_OVERRIDE_VALUE, DS.COD_SUPPLIER_BOB, DD.SK_DATE, PKPI.COD_CODE 
+					INTO #OVERRIDE_SELLER_SCORE
+				FROM	[$(JUMIA_BI_STG)].DBO.PRE_TOOLS_SELLER_OVERRIDE SKPI
+						JOIN [$(JUMIA_BI_STG)].DBO.PRE_TOOLS_KPI AS PKPI ON PKPI.ID = SKPI.COD_FK_KPI_PARENT 
+						JOIN DBO.DIM_DATE DD ON DD.DATE = SKPI.DAT_START_DATE
+						JOIN DBO.DIM_SUPPLIER DS ON DS.COD_SUPPLIER_BOB = SKPI.COD_SRC_ID
+				WHERE PKPI.FLG_IS_DELETED = 0 AND SKPI.DSC_CODE = 'PG' AND SKPI.FLG_IS_DELETED = 0
+					AND PKPI.COD_TYPE = 'OVERRIDE'
+						AND PKPI.COD_CODE IN ('NR_RETURN_ITEM','NR_CANCEL_ITEM')
+
+
+	-- clear partition
+	EXEC [dbo].[P_DROP_PARTITION_CONSTRAINT] @table_name = 'SELLER_SCORE_SNAPSHOT', @schema_name = 'part'
+	EXEC DBO.P_CHECK_PARTITION_EXISTS @table_name = 'SELLER_SCORE_SNAPSHOT', @schema_name = 'SLSC', @value = @SK_DATE_SNAPSHOT, @granularity = 0
+	EXEC DBO.P_CHECK_PARTITION_EXISTS @table_name = 'SELLER_SCORE_SNAPSHOT', @schema_name = 'SLSC', @value = @SK_NEXT_SNAPSHOT, @granularity = 0
+	TRUNCATE TABLE PART.SELLER_SCORE_SNAPSHOT
+	EXEC DBO.P_SWITCH_OUT_PARTITION @table_name = 'SELLER_SCORE_SNAPSHOT', @schema_name = 'SLSC',  @source_has_partitions = 1, @partition_value = @SK_DATE_SNAPSHOT, @table_name_destination = 'SELLER_SCORE_SNAPSHOT', @schema_name_destination = 'part', @destination_has_partitions = 0, @granularity =  0
+	TRUNCATE TABLE PART.SELLER_SCORE_SNAPSHOT
+
+
+;WITH SALES_DATA_AUX AS(
+SELECT   ORDERS.COD_SUPPLIER_BOB,
+      	 SUM(CASE WHEN ORDERS.SK_CONFIRMED_DATE BETWEEN @sk_date_13d AND @sk_date_7d AND (ORDERS.SK_STOCK_OUT_DATE > 10 OR ORDERS.SK_CANCELED_DATE > 10) AND ORDERS.SK_REASON IS NOT NULL THEN 1.0 ELSE 0 END)  AS SOI_CANCELLED_15D,
+	     SUM(CASE WHEN ORDERS.SK_CONFIRMED_DATE BETWEEN @sk_date_13d AND @sk_date_7d THEN 1.0 ELSE 0 END) AS SOI_CONFIRMED_15_8_D,
+         SUM(CASE WHEN ORDERS.SK_CONFIRMED_DATE BETWEEN @sk_date_34d AND @sk_date_7d AND (ORDERS.SK_STOCK_OUT_DATE > 10 OR ORDERS.SK_CANCELED_DATE > 10) AND ORDERS.SK_REASON IS NOT NULL THEN 1.0 ELSE 0 END)  AS SOI_CANCELLED_36D,
+		 SUM(CASE WHEN ORDERS.SK_CONFIRMED_DATE BETWEEN @sk_date_34d AND @sk_date_7d THEN 1.0 ELSE 0 END) AS SOI_CONFIRMED_36_8_D,
+		 SUM(CASE WHEN ORDERS.SK_DELIVERED_DATE BETWEEN @sk_date_13d AND @sk_date_7d AND ORDERS.SK_RETURNED_FINAL_DATE > 10 AND ORDERS.SK_REASON_AFTER_SALE IS NOT NULL AND 
+													(
+													(ORDERS.COD_REASON_PREFIX IN('AS18', 'AS19', 'AS21', 'AS22', 'AS23', 'AS24', 'AS25', 'AS35', 'AS36', 'CA27', 'CA28', 'CA29', 'CA30', 'CA32', 'CA33', 'CA34', 'CR12', 'CR13', 'CR15', 'CR16', 'CR17', 'CR18', 'CR29', 'CR30', 'IP11', 'NS10', 'NS11', 'NS13', 'NS14', 'NS15', 'NS16', 'NS17', 'NS18', 'NS20', 'NS25', 'NS26', 'RJ05', 'RJ11', 'RJ15', 'RJ16', 'RJ17', 'RJ18', 'RJ20', 'RJ21', 'RJ22', 'RJ23', 'RJ26', 'RJ27', 'RJ28', 'RJ32', 'RJ33', 'RJ34', 'RJ36', 'RJ37', 'RJ38', 'RJ41', 'RQ03', 'RQ04', 'RQ08', 'RQ11', 'RQ14', 'RQ15', 'RQ16', 'RQ17', 'RQ20', 'RS15', 'RS16', 'RS17', 'RS18', 'RS20', 'RS21', 'RS22', 'RS23', 'RS26', 'RS30', 'CA38', 'CA38D', 'CA41D', 'IP05D', 'IP07D', 'IP10D', 'IP11D', 'IP12D', 'IP13', 'IP13D', 'IP14D', 'NA10D', 'RS38', 'RS27D', 'CR24', 'CA49', 'RJ06')
+                                                     AND ORDERS.DSC_SHIPPING_TYPE_DESCRIPTION <> 'Warehouse')
+                                                     OR ORDERS.COD_REASON_PREFIX IN('AS12', 'AS13', 'AS14', 'AS16', 'AS17', 'AS20', 'CA31', 'CR06', 'CR07', 'CR08', 'CR10', 'CR11', 'CR14', 'IP10', 'NS04', 'NS05', 'NS06', 'NS08', 'NS09', 'NS12', 'RJ19', 'RQ18', 'RS19', 'IP09D', 'NA09D', 'AS15', 'CR09', 'NS07')
+												    ) THEN 1.0 ELSE 0 END)  AS SOI_RETURNED_15D,
+		SUM(CASE WHEN ORDERS.SK_DELIVERED_DATE BETWEEN @sk_date_13d AND @sk_date_7d THEN 1.0 ELSE 0 END) AS SOI_DELIVERED_15_8_D,
+		SUM(CASE WHEN ORDERS.SK_DELIVERED_DATE BETWEEN @sk_date_34d AND @sk_date_7d AND ORDERS.SK_RETURNED_FINAL_DATE > 10 AND ORDERS.SK_REASON_AFTER_SALE IS NOT NULL 
+													AND (
+														(ORDERS.COD_REASON_PREFIX IN('AS18', 'AS19', 'AS21', 'AS22', 'AS23', 'AS24', 'AS25', 'AS35', 'AS36', 'CA27', 'CA28', 'CA29', 'CA30', 'CA32', 'CA33', 'CA34', 'CR12', 'CR13', 'CR15', 'CR16', 'CR17', 'CR18', 'CR29', 'CR30', 'IP11', 'NS10', 'NS11', 'NS13', 'NS14', 'NS15', 'NS16', 'NS17', 'NS18', 'NS20', 'NS25', 'NS26', 'RJ05', 'RJ11', 'RJ15', 'RJ16', 'RJ17', 'RJ18', 'RJ20', 'RJ21', 'RJ22', 'RJ23', 'RJ26', 'RJ27', 'RJ28', 'RJ32', 'RJ33', 'RJ34', 'RJ36', 'RJ37', 'RJ38', 'RJ41', 'RQ03', 'RQ04', 'RQ08', 'RQ11', 'RQ14', 'RQ15', 'RQ16', 'RQ17', 'RQ20', 'RS15', 'RS16', 'RS17', 'RS18', 'RS20', 'RS21', 'RS22', 'RS23', 'RS26', 'RS30', 'CA38', 'CA38D', 'CA41D', 'IP05D', 'IP07D', 'IP10D', 'IP11D', 'IP12D', 'IP13', 'IP13D', 'IP14D', 'NA10D', 'RS38', 'RS27D', 'CR24', 'CA49', 'RJ06')
+														AND ORDERS.DSC_SHIPPING_TYPE_DESCRIPTION <> 'Warehouse')
+														OR ORDERS.COD_REASON_PREFIX IN('AS12', 'AS13', 'AS14', 'AS16', 'AS17', 'AS20', 'CA31', 'CR06', 'CR07', 'CR08', 'CR10', 'CR11', 'CR14', 'IP10', 'NS04', 'NS05', 'NS06', 'NS08', 'NS09', 'NS12', 'RJ19', 'RQ18', 'RS19', 'IP09D', 'NA09D', 'AS15', 'CR09', 'NS07')
+													 ) THEN 1.0 ELSE 0 END)  AS SOI_RETURNED_36D,
+		SUM(CASE WHEN ORDERS.SK_DELIVERED_DATE BETWEEN @sk_date_34d AND @sk_date_7d THEN 1.0 ELSE 0 END) AS SOI_DELIVERED_36_8_D,
+		ISNULL(COUNT(DISTINCT CASE WHEN ORDERS.SK_DELIVERED_DATE > 10 THEN ORDERS.SK_SALES_ORDER ELSE NULL END),0) AS SALES_ORDER_VOLUME,
+		MAX(ORDERS.ACR_7D) AS L7D_AVERAGE_CUSTOMER_RATING,
+        MAX(ORDERS.ACR_28D) AS L28D_AVERAGE_CUSTOMER_RATING,
+		MAX(ORDERS.NR_CR_7D) AS L7D_NR_CUSTOMER_RATINGS,
+		MAX(ORDERS.NR_CR_28D) AS L28D_NR_CUSTOMER_RATINGS,
+		-- ORDERS_SPEED_0_15_D
+		SUM(CASE WHEN ORDERS.SK_CONFIRMED_DATE BETWEEN @sk_date_13d AND @sk_date_7d AND ORDERS.ORDER_SPEED_SCORE = 0 THEN 1 ELSE 0 END) AS QTD_ORDERS_SPEED_0_15_D,
+		SUM(CASE WHEN ORDERS.SK_CONFIRMED_DATE BETWEEN @sk_date_13d AND @sk_date_7d AND ORDERS.ORDER_SPEED_SCORE = 1 THEN 1 ELSE 0 END) AS QTD_ORDERS_SPEED_1_15_D,
+		SUM(CASE WHEN ORDERS.SK_CONFIRMED_DATE BETWEEN @sk_date_13d AND @sk_date_7d AND ORDERS.ORDER_SPEED_SCORE = 2 THEN 1 ELSE 0 END) AS QTD_ORDERS_SPEED_2_15_D,
+		SUM(CASE WHEN ORDERS.SK_CONFIRMED_DATE BETWEEN @sk_date_13d AND @sk_date_7d AND ORDERS.ORDER_SPEED_SCORE = 3 THEN 1 ELSE 0 END) AS QTD_ORDERS_SPEED_3_15_D,
+		SUM(CASE WHEN ORDERS.SK_CONFIRMED_DATE BETWEEN @sk_date_13d AND @sk_date_7d AND ORDERS.ORDER_SPEED_SCORE = 4 THEN 1 ELSE 0 END) AS QTD_ORDERS_SPEED_4_15_D,
+		SUM(CASE WHEN ORDERS.SK_CONFIRMED_DATE BETWEEN @sk_date_13d AND @sk_date_7d AND ORDERS.ORDER_SPEED_SCORE = 5 THEN 1 ELSE 0 END) AS QTD_ORDERS_SPEED_5_15_D,
+		-- ORDERS_SPEED_0_36_D
+		SUM(CASE WHEN ORDERS.SK_CONFIRMED_DATE BETWEEN @sk_date_34d AND @sk_date_7d AND ORDERS.ORDER_SPEED_SCORE = 0 THEN 1 ELSE 0 END) AS QTD_ORDERS_SPEED_0_36_D,
+		SUM(CASE WHEN ORDERS.SK_CONFIRMED_DATE BETWEEN @sk_date_34d AND @sk_date_7d AND ORDERS.ORDER_SPEED_SCORE = 1 THEN 1 ELSE 0 END) AS QTD_ORDERS_SPEED_1_36_D,
+		SUM(CASE WHEN ORDERS.SK_CONFIRMED_DATE BETWEEN @sk_date_34d AND @sk_date_7d AND ORDERS.ORDER_SPEED_SCORE = 2 THEN 1 ELSE 0 END) AS QTD_ORDERS_SPEED_2_36_D,
+		SUM(CASE WHEN ORDERS.SK_CONFIRMED_DATE BETWEEN @sk_date_34d AND @sk_date_7d AND ORDERS.ORDER_SPEED_SCORE = 3 THEN 1 ELSE 0 END) AS QTD_ORDERS_SPEED_3_36_D,
+		SUM(CASE WHEN ORDERS.SK_CONFIRMED_DATE BETWEEN @sk_date_34d AND @sk_date_7d AND ORDERS.ORDER_SPEED_SCORE = 4 THEN 1 ELSE 0 END) AS QTD_ORDERS_SPEED_4_36_D,
+		SUM(CASE WHEN ORDERS.SK_CONFIRMED_DATE BETWEEN @sk_date_34d AND @sk_date_7d AND ORDERS.ORDER_SPEED_SCORE = 5 THEN 1 ELSE 0 END) AS QTD_ORDERS_SPEED_5_36_D
+FROM (
+SELECT 
+	DS.COD_SUPPLIER_BOB,
+	SOIS.SK_CONFIRMED_DATE,
+	SOIS.SK_STOCK_OUT_DATE,
+	SOIS.SK_CANCELED_DATE,
+	REA.SK_REASON,
+	SOIS.SK_DELIVERED_DATE,
+	SOIS.SK_RETURNED_FINAL_DATE,
+	REA_AFTER_SALE.SK_REASON AS SK_REASON_AFTER_SALE,
+	REA_AFTER_SALE.COD_REASON_PREFIX,
+	SHIP.DSC_SHIPPING_TYPE_DESCRIPTION,
+	SOIS.SK_SALES_ORDER,
+	ACR.ACR_7D,
+	ACR.ACR_28D,
+	ACR.NR_CR_7D,
+	ACR.NR_CR_28D,
+CASE WHEN SHIP.DSC_SHIPPING_TYPE_DESCRIPTION <> 'Drop Shipping' AND ISNULL(SOIS.SK_SHIPPED_DATE, -1) != -1 AND ISNULL(SOIS.SK_STOCK_OUT_DATE, -1) = -1 AND ISNULL(SOIS.SK_CANCELED_DATE, -1) = -1 THEN 5
+	     WHEN (SHIP.DSC_SHIPPING_TYPE_DESCRIPTION = 'Drop Shipping' AND (SOIS.SK_STOCK_OUT_DATE > 10 OR SOIS.SK_CANCELED_DATE > 10) AND REA.SK_REASON IS NOT NULL) THeN 0
+		 WHEN (SHIP.DSC_SHIPPING_TYPE_DESCRIPTION = 'Drop Shipping' AND ISNULL(SOIS.SK_SHIPPED_DATE, -1) != -1 -- Order is shipped...
+		       And DS.DSC_TAX_CLASS = 'international' -- Global Seller...
+			   ) THEN 
+			CASE 
+	            WHEN @JG_DOS_Saturdays = 1 THEN
+	                CASE 
+			    WHEN BUSINESS_DAYS_1.NR_BUSINESS_DAYS_WEEKEND_1 <= 0 THEN @JG_DOS_0D
+	                    WHEN BUSINESS_DAYS_1.NR_BUSINESS_DAYS_WEEKEND_1 = 1 THEN @JG_DOS_1D
+	                    WHEN BUSINESS_DAYS_1.NR_BUSINESS_DAYS_WEEKEND_1 = 2 THEN @JG_DOS_2D
+	                    WHEN BUSINESS_DAYS_1.NR_BUSINESS_DAYS_WEEKEND_1 = 3 THEN @JG_DOS_3D
+	                    WHEN BUSINESS_DAYS_1.NR_BUSINESS_DAYS_WEEKEND_1 = 4 THEN @JG_DOS_4D
+	                    WHEN BUSINESS_DAYS_1.NR_BUSINESS_DAYS_WEEKEND_1 = 5 THEN @JG_DOS_5D
+	                    WHEN BUSINESS_DAYS_1.NR_BUSINESS_DAYS_WEEKEND_1 >= 6 THEN @JG_DOS_6D
+	                END
+					ELSE
+	                CASE 
+		  	    WHEN BUSINESS_DAYS_2.NR_BUSINESS_DAYS_WEEKEND_2 <= 0 THEN @JG_DOS_0D
+	                    WHEN BUSINESS_DAYS_2.NR_BUSINESS_DAYS_WEEKEND_2 = 1 THEN @JG_DOS_1D
+	                    WHEN BUSINESS_DAYS_2.NR_BUSINESS_DAYS_WEEKEND_2 = 2 THEN @JG_DOS_2D
+	                    WHEN BUSINESS_DAYS_2.NR_BUSINESS_DAYS_WEEKEND_2 = 3 THEN @JG_DOS_3D
+	                    WHEN BUSINESS_DAYS_2.NR_BUSINESS_DAYS_WEEKEND_2 = 4 THEN @JG_DOS_4D
+	                    WHEN BUSINESS_DAYS_2.NR_BUSINESS_DAYS_WEEKEND_2 = 5 THEN @JG_DOS_5D
+	                    WHEN BUSINESS_DAYS_2.NR_BUSINESS_DAYS_WEEKEND_2 >= 6 THEN @JG_DOS_6D
+	                END
+			END
+	    WHEN (SHIP.DSC_SHIPPING_TYPE_DESCRIPTION = 'Drop Shipping' AND ISNULL(SOIS.SK_SHIPPED_DATE, -1) != -1 /* Order is shipped...  */  And DS.DSC_TAX_CLASS != 'international' /* Local Seller... */ ) THEN           
+	        CASE 
+	            WHEN @DOS_Saturdays = 1 THEN
+	                CASE 
+						WHEN BUSINESS_DAYS_1.NR_BUSINESS_DAYS_WEEKEND_1 <= 0 THEN @DOS_0D
+	                    WHEN BUSINESS_DAYS_1.NR_BUSINESS_DAYS_WEEKEND_1 = 1 THEN @DOS_1D
+	                    WHEN BUSINESS_DAYS_1.NR_BUSINESS_DAYS_WEEKEND_1 = 2 THEN @DOS_2D
+	                    WHEN BUSINESS_DAYS_1.NR_BUSINESS_DAYS_WEEKEND_1 = 3 THEN @DOS_3D
+	                    WHEN BUSINESS_DAYS_1.NR_BUSINESS_DAYS_WEEKEND_1 = 4 THEN @DOS_4D
+	                    WHEN BUSINESS_DAYS_1.NR_BUSINESS_DAYS_WEEKEND_1 = 5 THEN @DOS_5D
+	                    WHEN BUSINESS_DAYS_1.NR_BUSINESS_DAYS_WEEKEND_1 >= 6 THEN @DOS_6D
+	                END
+					ELSE
+	                CASE 
+						WHEN BUSINESS_DAYS_2.NR_BUSINESS_DAYS_WEEKEND_2 <= 0 THEN @DOS_0D
+	                    WHEN BUSINESS_DAYS_2.NR_BUSINESS_DAYS_WEEKEND_2 = 1 THEN @DOS_1D
+	                    WHEN BUSINESS_DAYS_2.NR_BUSINESS_DAYS_WEEKEND_2 = 2 THEN @DOS_2D
+	                    WHEN BUSINESS_DAYS_2.NR_BUSINESS_DAYS_WEEKEND_2 = 3 THEN @DOS_3D
+	                    WHEN BUSINESS_DAYS_2.NR_BUSINESS_DAYS_WEEKEND_2 = 4 THEN @DOS_4D
+	                    WHEN BUSINESS_DAYS_2.NR_BUSINESS_DAYS_WEEKEND_2 = 5 THEN @DOS_5D
+	                    WHEN BUSINESS_DAYS_2.NR_BUSINESS_DAYS_WEEKEND_2 >= 6 THEN @DOS_6D
+	                END
+			END 	END AS ORDER_SPEED_SCORE
+FROM DBO.FCT_SALES_ORDER_ITEM_MARKETING AS SOIS 
+	INNER JOIN DBO.DIM_SUPPLIER DS ON SOIS.SK_SUPPLIER = DS.SK_SUPPLIER
+	INNER JOIN DBO.V_D25_DIM_SHIPPING_TYPE AS SHIP ON SHIP.SK_SHIPPING_TYPE = SOIS.SK_SHIPPING_TYPE
+	LEFT JOIN DBO.DIM_REASON AS REA ON SOIS.SK_REASON = REA.SK_REASON AND REA.DSC_REASON_NAME IN('MER_1_-_Out_of_stock', 'MER_2_-_Quality_-_Item_Failed_QC') 
+			AND SHIP.DSC_SHIPPING_TYPE_DESCRIPTION <> 'Warehouse'
+	LEFT JOIN #ACR_TABLE AS ACR ON ACR.SK_SUPPLIER = SOIS.SK_SUPPLIER
+	LEFT JOIN #TEMP_QC AS AFTERSALE ON SOIS.SK_SALES_ORDER_ITEM = AFTERSALE.SK_SALES_ORDER_ITEM
+    LEFT JOIN DBO.DIM_REASON AS REA_AFTER_SALE ON AFTERSALE.SK_QC_REASON = REA_AFTER_SALE.SK_REASON
+                                                                               AND REA_AFTER_SALE.COD_REASON_PREFIX IN('AS12', 'AS13', 'AS14', 'AS16', 'AS17', 'AS18', 'AS19', 'AS20', 'AS21', 'AS22', 'AS23', 'AS24', 'AS25', 'AS35', 'AS36', 'CA27', 'CA28', 'CA29', 'CA30', 'CA31', 'CA32', 'CA33', 'CA34', 'CR06', 'CR07', 'CR08', 'CR10', 'CR11', 'CR12', 'CR13', 'CR14', 'CR15', 'CR16', 'CR17', 'CR18', 'CR29', 'CR30', 'IP10', 'IP11', 'NS04', 'NS05', 'NS06', 'NS08', 'NS09', 'NS10', 'NS11', 'NS12', 'NS13', 'NS14', 'NS15', 'NS16', 'NS17', 'NS18', 'NS20', 'NS25', 'NS26', 'RJ05', 'RJ11', 'RJ15', 'RJ16', 'RJ17', 'RJ18', 'RJ19', 'RJ20', 'RJ21', 'RJ22', 'RJ23', 'RJ26', 'RJ27', 'RJ28', 'RJ32', 'RJ33', 'RJ34', 'RJ36', 'RJ37', 'RJ38', 'RJ41', 'RQ03', 'RQ04', 'RQ08', 'RQ11', 'RQ14', 'RQ15', 'RQ16', 'RQ17', 'RQ18', 'RQ20', 'RS15', 'RS16', 'RS17', 'RS18', 'RS19', 'RS20', 'RS21', 'RS22', 'RS23', 'RS26', 'RS30', 'CA38', 'CA38D', 'CA41D', 'IP05D', 'IP07D', 'IP09D', 'IP10D', 'IP11D', 'IP12D', 'IP13', 'IP13D', 'IP14D', 'NA09D', 'NA10D', 'RS38', 'RS27D', 'CR24', 'AS15', 'CR09', 'NS07', 'CA49', 'RJ06')
+    INNER JOIN DBO.DIM_TIME DT ON DT.SK_TIME = SOIS.SK_TIME
+	OUTER APPLY (
+		SELECT 
+            ISNULL(
+                SUM(
+                    CASE 
+                        WHEN (DSC_WEEKEND = 'Weekend' AND DSC_DAY_WEEK != 6) OR FLAG_HOLIDAY = 1 
+                        THEN 0 
+                        ELSE 1 
+                    END 
+                ), 
+				0
+            ) -1 AS NR_BUSINESS_DAYS_WEEKEND_1
+		FROM DBO.DIM_DATE DD
+		WhERE DD.SK_DATE BETWEEN SOIS.SK_CONFIRMED_DATE AND SOIS.SK_SHIPPED_DATE
+		AND  ((DS.DSC_TAX_CLASS != 'international' AND @DOS_Saturdays = 1) OR (DS.DSC_TAX_CLASS = 'international' AND @JG_DOS_Saturdays = 1))
+	) AS BUSINESS_DAYS_1
+	OUTER APPLY (
+		SELECT 
+            ISNULL(
+                SUM(
+					CASE 
+                        WHEN DD.DSC_WEEKEND = 'Weekend' OR DD.FLAG_HOLIDAY = 1 
+                        THEN 0 
+						ELSE 1 
+					END
+				), 
+                0
+            ) -1 AS NR_BUSINESS_DAYS_WEEKEND_2
+		FROM DBO.DIM_DATE DD
+		WhERE DD.SK_DATE BETWEEN SOIS.SK_CONFIRMED_DATE AND SOIS.SK_SHIPPED_DATE
+		AND ((DS.DSC_TAX_CLASS != 'international' AND @DOS_Saturdays = 0) OR (DS.DSC_TAX_CLASS = 'international' AND @JG_DOS_Saturdays = 0))
+	) AS BUSINESS_DAYS_2
+	)  AS ORDERS
+GROUP BY ORDERS.COD_SUPPLIER_BOB
+), 
+SALES_DATA AS (
+
+	SELECT SDX.COD_SUPPLIER_BOB,
+		ROUND((CASE WHEN SDX.SOI_CANCELLED_15D < ISNULL(OVERRIDE_CANCELED_ITEMS.CANCELLED_15D,0) THEN 0 ELSE SDX.SOI_CANCELLED_15D - ISNULL(OVERRIDE_CANCELED_ITEMS.CANCELLED_15D,0) END / NULLIF(SDX.SOI_CONFIRMED_15_8_D, 0)) * 100, 2, 1) AS L7D_CANCELLATION_RATE, 
+		ROUND((CASE WHEN SDX.SOI_CANCELLED_36D < ISNULL(OVERRIDE_CANCELED_ITEMS.CANCELLED_36D,0) THEN 0 ELSE SDX.SOI_CANCELLED_36D - ISNULL(OVERRIDE_CANCELED_ITEMS.CANCELLED_36D,0) END / NULLIF(SDX.SOI_CONFIRMED_36_8_D, 0)) * 100, 2, 1) AS L28D_CANCELLATION_RATE,
+        ROUND((CASE WHEN SDX.SOI_RETURNED_15D < ISNULL(OVERRIDE_RETURN_ITEMS.RETURNED_15D,0) THEN 0 ELSE SDX.SOI_RETURNED_15D - ISNULL(OVERRIDE_RETURN_ITEMS.RETURNED_15D,0) END / NULLIF(SDX.SOI_DELIVERED_15_8_D, 0)) * 100, 2, 1) AS L7D_QUALITY_RETURN_RATE,
+        ROUND((CASE WHEN SDX.SOI_RETURNED_36D < ISNULL(OVERRIDE_RETURN_ITEMS.RETURNED_36D,0) THEN 0 ELSE SDX.SOI_RETURNED_36D - ISNULL(OVERRIDE_RETURN_ITEMS.RETURNED_36D,0) END / NULLIF(SDX.SOI_DELIVERED_36_8_D, 0)) * 100, 2, 1) AS L28D_QUALITY_RETURN_RATE,
+        SDX.L7D_AVERAGE_CUSTOMER_RATING,
+        SDX.L28D_AVERAGE_CUSTOMER_RATING,
+        SDX.SALES_ORDER_VOLUME,
+        CASE WHEN SDX.SOI_CANCELLED_15D < ISNULL(OVERRIDE_CANCELED_ITEMS.CANCELLED_15D,0) THEN 0 ELSE SDX.SOI_CANCELLED_15D - ISNULL(OVERRIDE_CANCELED_ITEMS.CANCELLED_15D,0) END AS SOI_CANCELLED_15D,
+        SDX.SOI_CONFIRMED_15_8_D,
+        CASE WHEN SDX.SOI_CANCELLED_36D < ISNULL(OVERRIDE_CANCELED_ITEMS.CANCELLED_36D,0) THEN 0 ELSE SDX.SOI_CANCELLED_36D - ISNULL(OVERRIDE_CANCELED_ITEMS.CANCELLED_36D,0) END AS SOI_CANCELLED_36D,
+        SDX.SOI_CONFIRMED_36_8_D,
+        CASE WHEN SDX.SOI_RETURNED_15D < ISNULL(OVERRIDE_RETURN_ITEMS.RETURNED_15D,0) THEN 0 ELSE SDX.SOI_RETURNED_15D - ISNULL(OVERRIDE_RETURN_ITEMS.RETURNED_15D,0) END AS SOI_RETURNED_15D,
+        SDX.SOI_DELIVERED_15_8_D,
+        CASE WHEN SDX.SOI_RETURNED_36D < ISNULL(OVERRIDE_RETURN_ITEMS.RETURNED_36D,0) THEN 0 ELSE SDX.SOI_RETURNED_36D - ISNULL(OVERRIDE_RETURN_ITEMS.RETURNED_36D,0) END AS SOI_RETURNED_36D,
+        SDX.SOI_DELIVERED_36_8_D,
+		SDX.L7D_NR_CUSTOMER_RATINGS,
+		SDX.L28D_NR_CUSTOMER_RATINGS,
+		--
+		-- The average seller drop off speed is calculated like: Score Sum / Total drop off orders after override.
+		CASE WHEN (
+			(CASE WHEN SDX.QTD_ORDERS_SPEED_0_15_D < ISNULL(OVERRIDE_CANCELED_ITEMS.CANCELLED_15D,0) THEN 0 ELSE SDX.QTD_ORDERS_SPEED_0_15_D - ISNULL(OVERRIDE_CANCELED_ITEMS.CANCELLED_15D,0) END) + 
+					   (SDX.QTD_ORDERS_SPEED_1_15_D) +
+			 		   (SDX.QTD_ORDERS_SPEED_2_15_D) +
+					   (SDX.QTD_ORDERS_SPEED_3_15_D) +
+					   (SDX.QTD_ORDERS_SPEED_4_15_D) +
+					   (SDX.QTD_ORDERS_SPEED_5_15_D)
+			       ) > 0 THEN -- Preventing from division by zero error...
+            ROUND(
+			CAST(
+			(		 
+					   (SDX.QTD_ORDERS_SPEED_1_15_D * 1) +
+			 		   (SDX.QTD_ORDERS_SPEED_2_15_D * 2) +
+					   (SDX.QTD_ORDERS_SPEED_3_15_D * 3) +
+					   (SDX.QTD_ORDERS_SPEED_4_15_D * 4) +
+					   (SDX.QTD_ORDERS_SPEED_5_15_D * 5)
+			) AS FLOAT) / -- Score Sum...
+			CAST(
+			(
+			(CASE WHEN SDX.QTD_ORDERS_SPEED_0_15_D < ISNULL(OVERRIDE_CANCELED_ITEMS.CANCELLED_15D,0) THEN 0 ELSE SDX.QTD_ORDERS_SPEED_0_15_D - ISNULL(OVERRIDE_CANCELED_ITEMS.CANCELLED_15D,0) END) + 
+					   (SDX.QTD_ORDERS_SPEED_1_15_D) +
+			 		   (SDX.QTD_ORDERS_SPEED_2_15_D) +
+					   (SDX.QTD_ORDERS_SPEED_3_15_D) +
+					   (SDX.QTD_ORDERS_SPEED_4_15_D) +
+					   (SDX.QTD_ORDERS_SPEED_5_15_D)
+			)  -- Total of orders speed after override...
+			AS FLOAT)
+			, 2)
+		ELSE NULL END AS L7D_DROP_OFF_SPEED_RATE,
+		CASE WHEN (
+			(CASE WHEN SDX.QTD_ORDERS_SPEED_0_36_D < ISNULL(OVERRIDE_CANCELED_ITEMS.CANCELLED_36D,0) THEN 0 ELSE SDX.QTD_ORDERS_SPEED_0_36_D - ISNULL(OVERRIDE_CANCELED_ITEMS.CANCELLED_36D,0) END) + 
+					   (SDX.QTD_ORDERS_SPEED_1_36_D) +
+			 		   (SDX.QTD_ORDERS_SPEED_2_36_D) +
+					   (SDX.QTD_ORDERS_SPEED_3_36_D) +
+					   (SDX.QTD_ORDERS_SPEED_4_36_D) +
+					   (SDX.QTD_ORDERS_SPEED_5_36_D)
+			       ) > 0 THEN -- Preventing from division by zero error...
+            ROUND(
+			CAST(
+			(		 
+					   (SDX.QTD_ORDERS_SPEED_1_36_D * 1) +
+			 		   (SDX.QTD_ORDERS_SPEED_2_36_D * 2) +
+					   (SDX.QTD_ORDERS_SPEED_3_36_D * 3) +
+					   (SDX.QTD_ORDERS_SPEED_4_36_D * 4) +
+					   (SDX.QTD_ORDERS_SPEED_5_36_D * 5)
+			) AS FLOAT) / -- Score Sum...
+			CAST(
+			(
+			(CASE WHEN SDX.QTD_ORDERS_SPEED_0_36_D < ISNULL(OVERRIDE_CANCELED_ITEMS.CANCELLED_36D,0) THEN 0 ELSE SDX.QTD_ORDERS_SPEED_0_36_D - ISNULL(OVERRIDE_CANCELED_ITEMS.CANCELLED_36D,0) END) + 
+					   (SDX.QTD_ORDERS_SPEED_1_36_D) +
+			 		   (SDX.QTD_ORDERS_SPEED_2_36_D) +
+					   (SDX.QTD_ORDERS_SPEED_3_36_D) +
+					   (SDX.QTD_ORDERS_SPEED_4_36_D) +
+					   (SDX.QTD_ORDERS_SPEED_5_36_D)
+			)  -- Total of orders speed after override...
+			AS FLOAT)
+			, 2)
+		ELSE NULL END AS L28D_DROP_OFF_SPEED_RATE
+	FROM SALES_DATA_AUX SDX
+		OUTER APPLY(
+				SELECT 
+					SUM(CASE WHEN OSS.SK_DATE BETWEEN @sk_date_13d AND @sk_date_7d THEN OSS.MTR_OVERRIDE_VALUE ELSE 0 END) CANCELLED_15D,
+					SUM(CASE WHEN OSS.SK_DATE BETWEEN @sk_date_34d AND @sk_date_7d THEN OSS.MTR_OVERRIDE_VALUE ELSE 0 END) CANCELLED_36D
+				FROM #OVERRIDE_SELLER_SCORE OSS 
+				WHERE OSS.COD_SUPPLIER_BOB = SDX.COD_SUPPLIER_BOB AND OSS.COD_CODE = 'Nr_Cancel_Item'
+		) AS OVERRIDE_CANCELED_ITEMS
+		OUTER APPLY(
+				SELECT 
+					SUM(CASE WHEN OSS.SK_DATE BETWEEN @sk_date_13d AND @sk_date_7d THEN OSS.MTR_OVERRIDE_VALUE ELSE 0 END) RETURNED_15D,
+					SUM(CASE WHEN OSS.SK_DATE BETWEEN @sk_date_34d AND @sk_date_7d THEN OSS.MTR_OVERRIDE_VALUE ELSE 0 END) RETURNED_36D					
+				FROM #OVERRIDE_SELLER_SCORE OSS 
+				WHERE OSS.COD_SUPPLIER_BOB = SDX.COD_SUPPLIER_BOB AND OSS.COD_CODE = 'Nr_Return_Item'
+		) AS OVERRIDE_RETURN_ITEMS
+
+), VENDOR_DATA AS(
+
+	SELECT SD.COD_SUPPLIER_BOB,
+		SD.L7D_CANCELLATION_RATE,
+			SD.L28D_CANCELLATION_RATE,
+				SD.L7D_QUALITY_RETURN_RATE,
+					SD.L28D_QUALITY_RETURN_RATE,
+						SD.L7D_AVERAGE_CUSTOMER_RATING,
+							SD.L28D_AVERAGE_CUSTOMER_RATING,
+								CASE WHEN SD.L7D_CANCELLATION_RATE IS NULL AND SD.L28D_CANCELLATION_RATE IS NOT NULL
+									THEN ISNULL(@l7d_cr * SD.L7D_CANCELLATION_RATE, 0) + @l28d_cr * SD.L28D_CANCELLATION_RATE
+										ELSE @l7d_cr * SD.L7D_CANCELLATION_RATE + @l28d_cr * SD.L28D_CANCELLATION_RATE END AS CANCELLATION_RATE_AVG,
+
+											CASE WHEN SD.L7D_QUALITY_RETURN_RATE IS NULL AND SD.L28D_QUALITY_RETURN_RATE IS NOT NULL
+												THEN ISNULL(@l7d_qrr * SD.L7D_QUALITY_RETURN_RATE, 0) + @l28d_qrr * SD.L28D_QUALITY_RETURN_RATE
+													ELSE @l7d_qrr * SD.L7D_QUALITY_RETURN_RATE + @l28d_qrr * SD.L28D_QUALITY_RETURN_RATE END AS QUALITY_RETURN_RATE_AVG,
+
+													CASE WHEN SD.L7D_AVERAGE_CUSTOMER_RATING IS NULL AND SD.L28D_AVERAGE_CUSTOMER_RATING IS NOT NULL
+														THEN ISNULL(@l7d_acr * SD.L7D_AVERAGE_CUSTOMER_RATING, 0) + @l28d_acr * SD.L28D_AVERAGE_CUSTOMER_RATING
+															ELSE @l7d_acr * SD.L7D_AVERAGE_CUSTOMER_RATING + @l28d_acr * SD.L28D_AVERAGE_CUSTOMER_RATING END AS OVERALL_AVERAGE_CUSTOMER_RATING_AVG,
+														SD.SALES_ORDER_VOLUME,
+																SD.SOI_CANCELLED_15D,
+																	SD.SOI_CONFIRMED_15_8_D,
+																		SD.SOI_CANCELLED_36D,
+																			SD.SOI_CONFIRMED_36_8_D,
+																				SD.SOI_RETURNED_15D,
+																					SD.SOI_DELIVERED_15_8_D,
+																						SD.SOI_RETURNED_36D,
+																							SD.SOI_DELIVERED_36_8_D,
+																								SD.L28D_NR_CUSTOMER_RATINGS,
+																									SD.L7D_NR_CUSTOMER_RATINGS,					
+																									--
+																									SD.L7D_DROP_OFF_SPEED_RATE,
+																									SD.L28D_DROP_OFF_SPEED_RATE,
+																									CASE WHEN SD.L7D_DROP_OFF_SPEED_RATE IS NULL AND SD.L28D_DROP_OFF_SPEED_RATE IS NOT NULL THEN 
+																												ISNULL(@l7d_dos * SD.L7D_DROP_OFF_SPEED_RATE, 0) + @l28d_dos * SD.L28D_DROP_OFF_SPEED_RATE
+																										 ELSE @l7d_dos * SD.L7D_DROP_OFF_SPEED_RATE + @l28d_dos * SD.L28D_DROP_OFF_SPEED_RATE 
+																									END AS DROP_OFF_SPEED_RATE_AVG
+
+
+	FROM SALES_DATA SD
+		
+), VENDOR_DATA_CLASS AS (
+SELECT
+	VD.COD_SUPPLIER_BOB,
+	VD.L7D_CANCELLATION_RATE,
+	SR_L7D_CR.DSC_RATING_CLASS AS L7D_CANCELLATION_RATE_GRADE,
+	VD.L28D_CANCELLATION_RATE,
+	SR_L28D_CR.DSC_RATING_CLASS AS L28D_CANCELLATION_RATE_GRADE,
+	VD.L7D_QUALITY_RETURN_RATE,
+	SR_L7D_QRR.DSC_RATING_CLASS AS L7D_QUALITY_RETURN_RATE_GRADE,
+	VD.L28D_QUALITY_RETURN_RATE,
+    SR_L28D_QRR.DSC_RATING_CLASS AS L28D_QUALITY_RETURN_RATE_GRADE,
+	VD.L7D_AVERAGE_CUSTOMER_RATING,
+	SR_L7D_ACR.DSC_RATING_CLASS AS L7D_AVERAGE_CUSTOMER_RATING_GRADE,	
+	VD.L28D_AVERAGE_CUSTOMER_RATING,
+	SR_L28D_ACR.DSC_RATING_CLASS AS L28D_AVERAGE_CUSTOMER_RATING_GRADE,
+	VD.CANCELLATION_RATE_AVG,
+	VD.QUALITY_RETURN_RATE_AVG,
+	VD.OVERALL_AVERAGE_CUSTOMER_RATING_AVG,
+	SR_CR.MTR_SCORE AS CANCELLATION_RATE_AVG_RANK,
+    SR_QRR.MTR_SCORE AS QUALITY_RETURN_RATE_AVG_RANK,
+    SR_ACR.MTR_SCORE AS OVERALL_AVERAGE_CUSTOMER_RATING_AVG_RANK,
+	VD.SALES_ORDER_VOLUME,
+	VD.SOI_CANCELLED_15D,
+    VD.SOI_CONFIRMED_15_8_D,
+    VD.SOI_CANCELLED_36D,
+    VD.SOI_CONFIRMED_36_8_D,
+    VD.SOI_RETURNED_15D,
+    VD.SOI_DELIVERED_15_8_D,
+    VD.SOI_RETURNED_36D,
+    VD.SOI_DELIVERED_36_8_D,
+	VD.L28D_NR_CUSTOMER_RATINGS,
+	VD.L7D_NR_CUSTOMER_RATINGS,
+	VD.L7D_DROP_OFF_SPEED_RATE,
+	VD.L28D_DROP_OFF_SPEED_RATE,
+	VD.DROP_OFF_SPEED_RATE_AVG,
+	SR_DOSR.MTR_SCORE AS DROP_OFF_SPEED_RATE_AVG_RANK,
+	SR_L7D_DOSR.DSC_RATING_CLASS AS L7D_DROP_OFF_SPEED_RATE_GRADE,
+	SR_L28D_DOSR.DSC_RATING_CLASS AS L28D_DROP_OFF_SPEED_RATE_GRADE
+            
+FROM VENDOR_DATA VD
+  LEFT JOIN #TOOLS_RANGE_KPI AS SR_L7D_CR ON SR_L7D_CR.P_COD_CODE = 'CR'
+	AND SR_L7D_CR.C_COD_CODE IS NULL
+    AND VD.L7D_CANCELLATION_RATE >= SR_L7D_CR.MTR_MIN
+    AND VD.L7D_CANCELLATION_RATE < SR_L7D_CR.MTR_MAX
+ LEFT JOIN #TOOLS_RANGE_KPI AS SR_L28D_CR ON SR_L28D_CR.P_COD_CODE = 'CR'
+	AND SR_L28D_CR.C_COD_CODE IS NULL
+	AND VD.L28D_CANCELLATION_RATE >= SR_L28D_CR.MTR_MIN
+    AND VD.L28D_CANCELLATION_RATE < SR_L28D_CR.MTR_MAX
+LEFT JOIN #TOOLS_RANGE_KPI AS SR_L7D_QRR ON SR_L7D_QRR.P_COD_CODE = 'QRR'
+	AND SR_L7D_QRR.C_COD_CODE IS NULL
+    AND VD.L7D_QUALITY_RETURN_RATE >= SR_L7D_QRR.MTR_MIN
+    AND VD.L7D_QUALITY_RETURN_RATE < SR_L7D_QRR.MTR_MAX
+LEFT JOIN #TOOLS_RANGE_KPI AS SR_L28D_QRR ON SR_L28D_QRR.P_COD_CODE = 'QRR'
+	AND SR_L28D_QRR.C_COD_CODE IS NULL
+    AND VD.L28D_QUALITY_RETURN_RATE >= SR_L28D_QRR.MTR_MIN
+    AND VD.L28D_QUALITY_RETURN_RATE < SR_L28D_QRR.MTR_MAX
+LEFT JOIN #TOOLS_RANGE_KPI AS SR_L7D_ACR ON SR_L7D_ACR.P_COD_CODE = 'ACR'
+	AND SR_L7D_ACR.C_COD_CODE IS NULL
+    AND VD.L7D_AVERAGE_CUSTOMER_RATING >= SR_L7D_ACR.MTR_MIN
+    AND VD.L7D_AVERAGE_CUSTOMER_RATING < SR_L7D_ACR.MTR_MAX
+LEFT JOIN #TOOLS_RANGE_KPI AS SR_L28D_ACR ON SR_L28D_ACR.P_COD_CODE = 'ACR'
+	AND SR_L28D_ACR.C_COD_CODE IS NULL
+    AND VD.L28D_AVERAGE_CUSTOMER_RATING >= SR_L28D_ACR.MTR_MIN
+    AND VD.L28D_AVERAGE_CUSTOMER_RATING < SR_L28D_ACR.MTR_MAX
+LEFT JOIN #TOOLS_RANGE_KPI AS SR_CR ON SR_CR.P_COD_CODE = 'CR'
+	AND VD.CANCELLATION_RATE_AVG >= SR_CR.MTR_MIN
+	AND VD.CANCELLATION_RATE_AVG < SR_CR.MTR_MAX
+LEFT JOIN #TOOLS_RANGE_KPI AS SR_QRR ON SR_QRR.P_COD_CODE = 'QRR'
+	AND VD.QUALITY_RETURN_RATE_AVG >= SR_QRR.MTR_MIN
+    AND VD.QUALITY_RETURN_RATE_AVG < SR_QRR.MTR_MAX
+LEFT JOIN #TOOLS_RANGE_KPI AS SR_ACR ON SR_ACR.P_COD_CODE = 'ACR'
+	AND VD.OVERALL_AVERAGE_CUSTOMER_RATING_AVG >= SR_ACR.MTR_MIN
+    AND VD.OVERALL_AVERAGE_CUSTOMER_RATING_AVG < SR_ACR.MTR_MAX
+LEFT JOIN #TOOLS_RANGE_KPI AS SR_DOSR ON SR_DOSR.P_COD_CODE = 'DOS'    
+	AND VD.DROP_OFF_SPEED_RATE_AVG >= SR_DOSR.MTR_MIN
+	AND VD.DROP_OFF_SPEED_RATE_AVG < SR_DOSR.MTR_MAX
+LEFT JOIN #TOOLS_RANGE_KPI AS SR_L7D_DOSR ON SR_L7D_DOSR.P_COD_CODE = 'DOS'
+	AND SR_L7D_DOSR.C_COD_CODE IS NULL
+    AND VD.L7D_DROP_OFF_SPEED_RATE >= SR_L7D_DOSR.MTR_MIN
+    AND VD.L7D_DROP_OFF_SPEED_RATE < SR_L7D_DOSR.MTR_MAX
+ LEFT JOIN #TOOLS_RANGE_KPI AS SR_L28D_DOSR ON SR_L28D_DOSR.P_COD_CODE = 'DOS'
+	AND SR_L28D_DOSR.C_COD_CODE IS NULL
+	AND VD.L28D_DROP_OFF_SPEED_RATE >= SR_L28D_DOSR.MTR_MIN
+    AND VD.L28D_DROP_OFF_SPEED_RATE < SR_L28D_DOSR.MTR_MAX
+), PRE_SELLER_SCORE AS (
+
+SELECT 
+	DS.COD_SUPPLIER_BOB,
+	VDC.L7D_CANCELLATION_RATE,
+	VDC.L7D_CANCELLATION_RATE_GRADE,
+	VDC.L28D_CANCELLATION_RATE,
+	VDC.L28D_CANCELLATION_RATE_GRADE,
+	VDC.L7D_QUALITY_RETURN_RATE,
+	VDC.L7D_QUALITY_RETURN_RATE_GRADE,
+	VDC.L28D_QUALITY_RETURN_RATE,
+    VDC.L28D_QUALITY_RETURN_RATE_GRADE,
+	VDC.L7D_AVERAGE_CUSTOMER_RATING,
+	VDC.L7D_AVERAGE_CUSTOMER_RATING_GRADE,	
+	VDC.L28D_AVERAGE_CUSTOMER_RATING,
+	VDC.L28D_AVERAGE_CUSTOMER_RATING_GRADE,
+	VDC.CANCELLATION_RATE_AVG,
+	VDC.QUALITY_RETURN_RATE_AVG,
+	VDC.OVERALL_AVERAGE_CUSTOMER_RATING_AVG,
+	VDC.CANCELLATION_RATE_AVG_RANK,
+    VDC.QUALITY_RETURN_RATE_AVG_RANK,
+    VDC.OVERALL_AVERAGE_CUSTOMER_RATING_AVG_RANK,
+	ISNULL(VDC.SALES_ORDER_VOLUME,0) SALES_ORDER_VOLUME,
+	DATEDIFF(day, DS.DAT_CREATED_AT_BOB, GETDATE()) AS AGE,
+	VDC.SOI_CANCELLED_15D,
+    VDC.SOI_CONFIRMED_15_8_D,
+    VDC.SOI_CANCELLED_36D,
+    VDC.SOI_CONFIRMED_36_8_D,
+    VDC.SOI_RETURNED_15D,
+    VDC.SOI_DELIVERED_15_8_D,
+    VDC.SOI_RETURNED_36D,
+    VDC.SOI_DELIVERED_36_8_D,
+	VDC.L28D_NR_CUSTOMER_RATINGS,
+	VDC.L7D_NR_CUSTOMER_RATINGS,
+	VDC.L7D_DROP_OFF_SPEED_RATE,
+	VDC.L28D_DROP_OFF_SPEED_RATE,
+	VDC.DROP_OFF_SPEED_RATE_AVG,
+	VDC.DROP_OFF_SPEED_RATE_AVG_RANK,
+	VDC.L7D_DROP_OFF_SPEED_RATE_GRADE,
+	VDC.L28D_DROP_OFF_SPEED_RATE_GRADE,
+	DS.DSC_PAYOUT_DAYS,
+	CAST(
+		ISNULL(VDC.CANCELLATION_RATE_AVG_RANK, 0.0) * ISNULL(@sellerscore_cr, 0.0) / NULLIF(ISNULL(IIF(VDC.OVERALL_AVERAGE_CUSTOMER_RATING_AVG_RANK IS NULL, 0.0, @sellerscore_acr), 0.0) + 
+			ISNULL(IIF(VDC.CANCELLATION_RATE_AVG_RANK IS NULL, 0.0, @sellerscore_cr), 0.0) + ISNULL(IIF(VDC.QUALITY_RETURN_RATE_AVG_RANK IS NULL, 0.0, @sellerscore_qrr), 0.0), 0) + 
+				ISNULL(VDC.QUALITY_RETURN_RATE_AVG_RANK, 0.0) * ISNULL(@sellerscore_qrr, 0.0) / NULLIF(ISNULL(IIF(VDC.OVERALL_AVERAGE_CUSTOMER_RATING_AVG_RANK IS NULL, 0.0, @sellerscore_acr), 0.0) + 
+					ISNULL(IIF(VDC.CANCELLATION_RATE_AVG_RANK IS NULL, 0.0, @sellerscore_cr), 0.0) + ISNULL(IIF(VDC.QUALITY_RETURN_RATE_AVG_RANK IS NULL, 0.0, @sellerscore_qrr), 0.0), 0.0) + 
+						ISNULL(VDC.OVERALL_AVERAGE_CUSTOMER_RATING_AVG_RANK, 0.0) * ISNULL(@sellerscore_acr, 0.0) / NULLIF(ISNULL(IIF(VDC.OVERALL_AVERAGE_CUSTOMER_RATING_AVG_RANK IS NULL, 0.0, @sellerscore_acr), 0.0) + 
+							ISNULL(IIF(VDC.CANCELLATION_RATE_AVG_RANK IS NULL, 0.0, @sellerscore_cr), 0.0) + ISNULL(IIF(VDC.QUALITY_RETURN_RATE_AVG_RANK IS NULL, 0.0, @sellerscore_qrr), 0.0), 0) 
+	AS DECIMAL(10, 2)) AS PRESCORE,
+	CAST(
+	ISNULL(VDC.DROP_OFF_SPEED_RATE_AVG_RANK, 0.0) * ISNULL(@sellerscore_cr, 0.0) / NULLIF(ISNULL(IIF(VDC.OVERALL_AVERAGE_CUSTOMER_RATING_AVG_RANK IS NULL, 0.0, @sellerscore_acr), 0.0) + 
+		ISNULL(IIF(VDC.DROP_OFF_SPEED_RATE_AVG_RANK IS NULL, 0.0, @sellerscore_cr), 0.0) + ISNULL(IIF(VDC.QUALITY_RETURN_RATE_AVG_RANK IS NULL, 0.0, @sellerscore_qrr), 0.0), 0) + 
+			ISNULL(VDC.QUALITY_RETURN_RATE_AVG_RANK, 0.0) * ISNULL(@sellerscore_qrr, 0.0) / NULLIF(ISNULL(IIF(VDC.OVERALL_AVERAGE_CUSTOMER_RATING_AVG_RANK IS NULL, 0.0, @sellerscore_acr), 0.0) + 
+				ISNULL(IIF(VDC.DROP_OFF_SPEED_RATE_AVG_RANK IS NULL, 0.0, @sellerscore_cr), 0.0) + ISNULL(IIF(VDC.QUALITY_RETURN_RATE_AVG_RANK IS NULL, 0.0, @sellerscore_qrr), 0.0), 0.0) + 
+					ISNULL(VDC.OVERALL_AVERAGE_CUSTOMER_RATING_AVG_RANK, 0.0) * ISNULL(@sellerscore_acr, 0.0) / NULLIF(ISNULL(IIF(VDC.OVERALL_AVERAGE_CUSTOMER_RATING_AVG_RANK IS NULL, 0.0, @sellerscore_acr), 0.0) + 
+						ISNULL(IIF(VDC.DROP_OFF_SPEED_RATE_AVG_RANK IS NULL, 0.0, @sellerscore_cr), 0.0) + ISNULL(IIF(VDC.QUALITY_RETURN_RATE_AVG_RANK IS NULL, 0.0, @sellerscore_qrr), 0.0), 0) 
+	AS DECIMAL(10, 2)) AS NEW_PRESCORE
+FROM dbo.DIM_SUPPLIER DS
+	LEFT JOIN VENDOR_DATA_CLASS VDC ON DS.COD_SUPPLIER_BOB = VDC.COD_SUPPLIER_BOB
+WHERE DS.COD_SUPPLIER_BOB IS NOT NULL
+AND DS.COD_SUPPLIER_BOB <> -1
+
+)
+
+
+INSERT INTO PART.SELLER_SCORE_SNAPSHOT
+									  (SK_DATE_SNAPSHOT,
+									   COD_SUPPLIER_BOB,
+									   L7D_CANCELLATION_RATE,
+									   L7D_CANCELLATION_RATE_GRADE,
+									   L28D_CANCELLATION_RATE,
+									   L28D_CANCELLATION_RATE_GRADE,
+									   L7D_QUALITY_RETURN_RATE,
+									   L7D_QUALITY_RETURN_RATE_GRADE,
+									   L28D_QUALITY_RETURN_RATE,
+									   L28D_QUALITY_RETURN_RATE_GRADE,
+									   L7D_AVERAGE_CUSTOMER_RATING,
+									   L7D_AVERAGE_CUSTOMER_RATING_GRADE,
+									   L28D_AVERAGE_CUSTOMER_RATING,
+									   L28D_AVERAGE_CUSTOMER_RATING_GRADE,
+									   CANCELLATION_RATE_AVG,
+									   QUALITY_RETURN_RATE_AVG,
+									   OVERALL_AVERAGE_CUSTOMER_RATING_AVG,
+									   CANCELLATION_RATE_AVG_RANK, 
+									   QUALITY_RETURN_RATE_AVG_RANK, 
+									   OVERALL_AVERAGE_CUSTOMER_RATING_AVG_RANK,
+									   SALES_ORDER_VOLUME, 
+									   AGE, 
+									   SOI_CANCELLED_15D, 
+									   SOI_CONFIRMED_15_8_D, 
+									   SOI_CANCELLED_36D, 
+									   SOI_CONFIRMED_36_8_D, 
+									   SOI_RETURNED_15D, 
+									   SOI_DELIVERED_15_8_D,
+									   SOI_RETURNED_36D, 
+									   SOI_DELIVERED_36_8_D, 
+									   L28D_NR_CUSTOMER_RATINGS, 
+									   L7D_NR_CUSTOMER_RATINGS, 
+									   DSC_PAYOUT_DAYS, 
+									   L7D_DROP_OFF_SPEED_RATE,
+									   L28D_DROP_OFF_SPEED_RATE,
+									   DROP_OFF_SPEED_RATE_AVG,
+									   DROP_OFF_SPEED_RATE_AVG_RANK,
+									   L7D_DROP_OFF_SPEED_RATE_GRADE,
+									   L28D_DROP_OFF_SPEED_RATE_GRADE,
+									   NEW_PRESCORE,
+									   PRESCORE, 
+									   SELLER_SCORE, 
+									   SK_AUD_INSERT)
+SELECT 
+	@SK_DATE_SNAPSHOT as SK_DATE_SNAPSHOT,
+	PSS.COD_SUPPLIER_BOB,
+	PSS.L7D_CANCELLATION_RATE,
+	PSS.L7D_CANCELLATION_RATE_GRADE,
+	PSS.L28D_CANCELLATION_RATE,
+	PSS.L28D_CANCELLATION_RATE_GRADE,
+	PSS.L7D_QUALITY_RETURN_RATE,
+	PSS.L7D_QUALITY_RETURN_RATE_GRADE,
+	PSS.L28D_QUALITY_RETURN_RATE,
+    PSS.L28D_QUALITY_RETURN_RATE_GRADE,
+	PSS.L7D_AVERAGE_CUSTOMER_RATING,
+	PSS.L7D_AVERAGE_CUSTOMER_RATING_GRADE,	
+	PSS.L28D_AVERAGE_CUSTOMER_RATING,
+	PSS.L28D_AVERAGE_CUSTOMER_RATING_GRADE,
+	PSS.CANCELLATION_RATE_AVG,
+	PSS.QUALITY_RETURN_RATE_AVG,
+	PSS.OVERALL_AVERAGE_CUSTOMER_RATING_AVG,
+	PSS.CANCELLATION_RATE_AVG_RANK,
+    PSS.QUALITY_RETURN_RATE_AVG_RANK,
+    PSS.OVERALL_AVERAGE_CUSTOMER_RATING_AVG_RANK,
+	PSS.SALES_ORDER_VOLUME,
+	PSS.AGE,
+	PSS.SOI_CANCELLED_15D,
+    PSS.SOI_CONFIRMED_15_8_D,
+    PSS.SOI_CANCELLED_36D,
+    PSS.SOI_CONFIRMED_36_8_D,
+    PSS.SOI_RETURNED_15D,
+    PSS.SOI_DELIVERED_15_8_D,
+    PSS.SOI_RETURNED_36D,
+    PSS.SOI_DELIVERED_36_8_D,
+	PSS.L28D_NR_CUSTOMER_RATINGS,
+	PSS.L7D_NR_CUSTOMER_RATINGS,
+	PSS.DSC_PAYOUT_DAYS,
+	PSS.L7D_DROP_OFF_SPEED_RATE,
+	PSS.L28D_DROP_OFF_SPEED_RATE,
+	PSS.DROP_OFF_SPEED_RATE_AVG,
+	PSS.DROP_OFF_SPEED_RATE_AVG_RANK,
+	PSS.L7D_DROP_OFF_SPEED_RATE_GRADE,
+	PSS.L28D_DROP_OFF_SPEED_RATE_GRADE,
+	PSS.NEW_PRESCORE,
+	PSS.PRESCORE,
+    CASE WHEN PSS.SALES_ORDER_VOLUME < @s3_sov OR PSS.AGE < @s3_age THEN 3.00
+        WHEN PSS.NEW_PRESCORE = 5.00 AND PSS.AGE > @s5_age AND PSS.SALES_ORDER_VOLUME > @s5_sov THEN 5.00
+        WHEN PSS.NEW_PRESCORE = 5.00 AND (PSS.AGE <= @s5_age OR PSS.SALES_ORDER_VOLUME <= @s5_sov) THEN 4.90 ELSE PSS.NEW_PRESCORE END AS SELLER_SCORE, 
+	@SK_AUD
+ 
+FROM PRE_SELLER_SCORE PSS
+
+
+	exec dbo.P_PARTITION_CONSTRAINT @table_name = 'SELLER_SCORE_SNAPSHOT', @schema_name = 'PART', @column_name = 'sk_date_snapshot', @partition_value = @SK_DATE_SNAPSHOT, @granularity = 0
+	EXEC DBO.P_SWITCH_OUT_PARTITION @table_name = 'SELLER_SCORE_SNAPSHOT', @schema_name = 'PART',  @source_has_partitions = 0, @partition_value = @SK_DATE_SNAPSHOT, @table_name_destination = 'SELLER_SCORE_SNAPSHOT', @schema_name_destination = 'SLSC', @destination_has_partitions = 1, @granularity = 0
+
+
+END
